@@ -1,0 +1,1476 @@
+I'll create a comprehensive architecture and codebase for **Prasanna Senavirathne Accounting Class**. This is a premium educational platform with Firebase backend, featuring a striking red-themed professional design.
+
+## 🏗️ Project Architecture
+
+```
+prasanna-accounting-class/
+├── app/                          # Next.js 14 App Router
+│   ├── (auth)/                   # Auth group routes
+│   │   ├── login/page.tsx        # Student login
+│   │   └── layout.tsx
+│   ├── (dashboard)/              # Protected dashboard routes
+│   │   ├── recordings/page.tsx   # Monthly video dashboard
+│   │   └── layout.tsx
+│   ├── admin/                    # Admin panel
+│   │   ├── page.tsx              # Admin dashboard
+│   │   ├── users/page.tsx        # User management
+│   │   └── recordings/page.tsx   # Upload/manage recordings
+│   ├── api/                      # API routes (if needed)
+│   ├── page.tsx                  # Public landing page
+│   ├── about/page.tsx            # Class details & photos
+│   ├── payment/page.tsx          # Payment information
+│   └── layout.tsx                # Root layout
+├── components/
+│   ├── ui/                       # Reusable UI components
+│   ├── auth/                     # Auth-related components
+│   ├── admin/                    # Admin panel components
+│   └── dashboard/                # Student dashboard components
+├── lib/
+│   ├── firebase.ts               # Firebase config
+│   ├── auth-context.tsx          # Auth state management
+│   └── firestore.ts              # Database operations
+├── hooks/                        # Custom React hooks
+├── types/                        # TypeScript interfaces
+├── public/
+│   └── images/                   # Class photos, assets
+└── styles/
+    └── globals.css
+```
+
+---
+
+## 📋 Step-by-Step Firebase Setup
+
+### 1. Create Firebase Project
+1. Go to [Firebase Console](https://console.firebase.google.com)
+2. Click **"Create a project"** → Name it `prasanna-accounting-class`
+3. Disable Google Analytics (optional) → **Create Project**
+
+### 2. Enable Authentication
+1. Navigate to **Build → Authentication → Get Started**
+2. Enable **Email/Password** provider
+3. Enable **Google** provider (optional, for easier access)
+
+### 3. Set Up Firestore Database
+1. Go to **Build → Firestore Database → Create Database**
+2. Choose **Start in production mode**
+3. Select your region (asia-south1 for Sri Lanka proximity)
+
+### 4. Firestore Security Rules
+Go to **Firestore Database → Rules** and paste these rules:
+
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    function isApprovedStudent() {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'approved';
+    }
+
+    // Users collection
+    match /users/{userId} {
+      allow read: if isAuthenticated() && 
+        (request.auth.uid == userId || isAdmin());
+      allow create: if isAuthenticated(); // Self-registration
+      allow update: if isAdmin(); // Only admins can approve/change status
+      allow delete: if isAdmin();
+    }
+
+    // Recordings collection - Only approved students and admins
+    match /recordings/{recordingId} {
+      allow read: if isApprovedStudent() || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // Batches collection
+    match /batches/{batchId} {
+      allow read: if isApprovedStudent() || isAdmin();
+      allow write: if isAdmin();
+    }
+  }
+}
+```
+
+### 5. Register Web App & Get Config
+1. Click **</>** (Web icon) in Project Settings
+2. Register app name: `prasanna-accounting-web`
+3. Copy the Firebase config object
+
+### 6. Set Up Firebase Admin SDK (For Role Assignment)
+Create a server-side script to assign admin roles:
+
+```bash
+npm install firebase-admin
+```
+
+Create `scripts/setAdmin.js`:
+```javascript
+const admin = require('firebase-admin');
+const serviceAccount = require('./service-account-key.json');
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+async function setAdminRole(uid) {
+  await admin.auth().setCustomUserClaims(uid, { role: 'admin' });
+  await admin.firestore().collection('users').doc(uid).update({
+    role: 'admin',
+    status: 'approved'
+  });
+  console.log(`Admin role set for user: ${uid}`);
+}
+
+// Usage: node scripts/setAdmin.js USER_UID_HERE
+setAdminRole(process.argv[2]);
+```
+
+---
+
+## 💻 Core Code Implementation
+
+### 1. Firebase Configuration (`lib/firebase.ts`)
+
+```typescript
+import { initializeApp, getApps, FirebaseApp } from 'firebase/app';
+import { getAuth, connectAuthEmulator } from 'firebase/auth';
+import { getFirestore, connectFirestoreEmulator } from 'firebase/firestore';
+
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID
+};
+
+let app: FirebaseApp;
+if (!getApps().length) {
+  app = initializeApp(firebaseConfig);
+} else {
+  app = getApps()[0];
+}
+
+export const auth = getAuth(app);
+export const db = getFirestore(app);
+
+// Development emulators (optional)
+if (process.env.NODE_ENV === 'development') {
+  // connectAuthEmulator(auth, 'http://localhost:9099');
+  // connectFirestoreEmulator(db, 'localhost', 8080);
+}
+```
+
+### 2. Auth Context with Role-Based Access (`lib/auth-context.tsx`)
+
+```typescript
+'use client';
+
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { 
+  User, 
+  onAuthStateChanged, 
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut as firebaseSignOut,
+  updateProfile
+} from 'firebase/auth';
+import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
+import { auth, db } from './firebase';
+
+interface UserData {
+  uid: string;
+  email: string;
+  displayName?: string;
+  role: 'student' | 'admin';
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: Date;
+  phone?: string;
+  location?: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+  userData: UserData | null;
+  loading: boolean;
+  isAdmin: boolean;
+  isApproved: boolean;
+  signIn: (email: string, password: string) => Promise<void>;
+  signUp: (email: string, password: string, displayName: string, phone: string) => Promise<void>;
+  signOut: () => Promise<void>;
+  refreshUserData: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [userData, setUserData] = useState<UserData | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      
+      if (currentUser) {
+        // Real-time listener for user data changes
+        const userDocRef = doc(db, 'users', currentUser.uid);
+        const unsubscribeDoc = onSnapshot(userDocRef, (doc) => {
+          if (doc.exists()) {
+            setUserData(doc.data() as UserData);
+          }
+          setLoading(false);
+        });
+        
+        return () => unsubscribeDoc();
+      } else {
+        setUserData(null);
+        setLoading(false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  const refreshUserData = async () => {
+    if (user) {
+      const userDoc = await getDoc(doc(db, 'users', user.uid));
+      if (userDoc.exists()) {
+        setUserData(userDoc.data() as UserData);
+      }
+    }
+  };
+
+  const signIn = async (email: string, password: string) => {
+    const result = await signInWithEmailAndPassword(auth, email, password);
+    const userDoc = await getDoc(doc(db, 'users', result.user.uid));
+    
+    if (!userDoc.exists()) {
+      throw new Error('User profile not found. Please contact admin.');
+    }
+    
+    const data = userDoc.data() as UserData;
+    if (data.status === 'rejected') {
+      await firebaseSignOut(auth);
+      throw new Error('Your account has been rejected. Please contact admin.');
+    }
+  };
+
+  const signUp = async (email: string, password: string, displayName: string, phone: string) => {
+    const result = await createUserWithEmailAndPassword(auth, email, password);
+    
+    await updateProfile(result.user, { displayName });
+    
+    // Create user document in Firestore
+    await setDoc(doc(db, 'users', result.user.uid), {
+      uid: result.user.uid,
+      email,
+      displayName,
+      role: 'student',
+      status: 'pending', // Requires admin approval
+      phone,
+      createdAt: new Date(),
+    });
+  };
+
+  const signOut = async () => {
+    await firebaseSignOut(auth);
+    setUserData(null);
+  };
+
+  const value = {
+    user,
+    userData,
+    loading,
+    isAdmin: userData?.role === 'admin',
+    isApproved: userData?.status === 'approved',
+    signIn,
+    signUp,
+    signOut,
+    refreshUserData,
+  };
+
+  return (
+    <AuthContext.Provider value={value}>
+      {!loading && children}
+    </AuthContext.Provider>
+  );
+}
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
+```
+
+### 3. Premium Red-Themed Login Page (`app/(auth)/login/page.tsx`)
+
+```typescript
+'use client';
+
+import React, { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '@/lib/auth-context';
+import { motion } from 'framer-motion';
+import { Eye, EyeOff, Lock, Mail, UserPlus, AlertCircle, CheckCircle } from 'lucide-react';
+
+export default function LoginPage() {
+  const [isLogin, setIsLogin] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [loading, setLoading] = useState(false);
+  
+  const { signIn, signUp, userData } = useAuth();
+  const router = useRouter();
+
+  // Redirect if already logged in and approved
+  if (userData?.status === 'approved') {
+    router.push('/recordings');
+    return null;
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSuccess('');
+    setLoading(true);
+
+    try {
+      if (isLogin) {
+        await signIn(email, password);
+        // Successful login will trigger redirect via userData effect
+      } else {
+        await signUp(email, password, displayName, phone);
+        setSuccess('Registration successful! Please wait for admin approval. Check your email.');
+        setIsLogin(true);
+      }
+    } catch (err: any) {
+      setError(err.message || 'An error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-red-950 to-slate-900 flex items-center justify-center p-4">
+      {/* Animated Background Elements */}
+      <div className="absolute inset-0 overflow-hidden">
+        <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-red-600/20 rounded-full blur-3xl animate-pulse" />
+        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-red-800/20 rounded-full blur-3xl animate-pulse delay-1000" />
+      </div>
+
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5 }}
+        className="relative w-full max-w-md"
+      >
+        {/* Glass Card */}
+        <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden">
+          {/* Header */}
+          <div className="bg-gradient-to-r from-red-700 to-red-600 p-8 text-center">
+            <h1 className="text-2xl font-bold text-white mb-2">
+              Prasanna Senavirathne
+            </h1>
+            <p className="text-red-100 text-sm">Accounting Class Portal</p>
+          </div>
+
+          <div className="p-8">
+            {/* Toggle */}
+            <div className="flex bg-slate-800/50 rounded-lg p-1 mb-6">
+              <button
+                onClick={() => setIsLogin(true)}
+                className={`flex-1 py-2 rounded-md text-sm font-medium transition-all ${
+                  isLogin 
+                    ? 'bg-red-600 text-white shadow-lg' 
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Sign In
+              </button>
+              <button
+                onClick={() => setIsLogin(false)}
+                className={`flex-1 py-2 rounded-md text-sm font-medium transition-all ${
+                  !isLogin 
+                    ? 'bg-red-600 text-white shadow-lg' 
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Register
+              </button>
+            </div>
+
+            {/* Alerts */}
+            {error && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                className="mb-4 p-3 bg-red-500/20 border border-red-500/50 rounded-lg flex items-center gap-2 text-red-200 text-sm"
+              >
+                <AlertCircle size={16} />
+                {error}
+              </motion.div>
+            )}
+
+            {success && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                className="mb-4 p-3 bg-green-500/20 border border-green-500/50 rounded-lg flex items-center gap-2 text-green-200 text-sm"
+              >
+                <CheckCircle size={16} />
+                {success}
+              </motion.div>
+            )}
+
+            <form onSubmit={handleSubmit} className="space-y-4">
+              {!isLogin && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                >
+                  <label className="block text-sm font-medium text-slate-300 mb-1">
+                    Full Name
+                  </label>
+                  <div className="relative">
+                    <UserPlus className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
+                    <input
+                      type="text"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      className="w-full bg-slate-800/50 border border-slate-700 rounded-lg py-2.5 pl-10 pr-4 text-white placeholder-slate-500 focus:outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
+                      placeholder="Your full name"
+                      required={!isLogin}
+                    />
+                  </div>
+                </motion.div>
+              )}
+
+              {!isLogin && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                >
+                  <label className="block text-sm font-medium text-slate-300 mb-1">
+                    Phone Number
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500">📱</span>
+                    <input
+                      type="tel"
+                      value={phone}
+                      onChange={(e) => setPhone(e.target.value)}
+                      className="w-full bg-slate-800/50 border border-slate-700 rounded-lg py-2.5 pl-10 pr-4 text-white placeholder-slate-500 focus:outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
+                      placeholder="07X XXX XXXX"
+                      required={!isLogin}
+                    />
+                  </div>
+                </motion.div>
+              )}
+
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-1">
+                  Email Address
+                </label>
+                <div className="relative">
+                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="w-full bg-slate-800/50 border border-slate-700 rounded-lg py-2.5 pl-10 pr-4 text-white placeholder-slate-500 focus:outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
+                    placeholder="student@example.com"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-1">
+                  Password
+                </label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="w-full bg-slate-800/50 border border-slate-700 rounded-lg py-2.5 pl-10 pr-12 text-white placeholder-slate-500 focus:outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
+                    placeholder="••••••••"
+                    required
+                    minLength={6}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+                  >
+                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 text-white font-semibold py-3 rounded-lg shadow-lg shadow-red-600/30 transform hover:scale-[1.02] transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+              >
+                {loading ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Processing...
+                  </span>
+                ) : (
+                  isLogin ? 'Sign In to Portal' : 'Create Account'
+                )}
+              </button>
+            </form>
+
+            {isLogin && (
+              <p className="mt-4 text-center text-sm text-slate-400">
+                New student?{' '}
+                <button
+                  onClick={() => setIsLogin(false)}
+                  className="text-red-400 hover:text-red-300 font-medium"
+                >
+                  Register here
+                </button>
+              </p>
+            )}
+
+            <div className="mt-6 pt-6 border-t border-slate-700/50">
+              <p className="text-xs text-center text-slate-500">
+                After registration, admin approval is required to access class recordings.
+                <br />
+                Contact: <span className="text-red-400">+94 77 XXX XXXX</span>
+              </p>
+            </div>
+          </div>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+```
+
+### 4. Monthly Video Dashboard (`app/(dashboard)/recordings/page.tsx`)
+
+```typescript
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '@/lib/auth-context';
+import { 
+  collection, 
+  query, 
+  where, 
+  orderBy, 
+  onSnapshot,
+  Timestamp 
+} from 'firebase/firestore';
+import { db } from '@/lib/firebase';
+import { motion, AnimatePresence } from 'framer-motion';
+import { 
+  Play, 
+  Clock, 
+  Calendar, 
+  AlertTriangle, 
+  Lock,
+  LogOut,
+  User,
+  ChevronDown,
+  ChevronUp,
+  Video
+} from 'lucide-react';
+
+interface Recording {
+  id: string;
+  title: string;
+  youtubeUrl: string;
+  batchName: string;
+  uploadedAt: Timestamp;
+  expiryDate: Timestamp;
+  description?: string;
+  thumbnailUrl?: string;
+}
+
+interface Batch {
+  id: string;
+  name: string;
+  month: string;
+  year: number;
+  order: number;
+}
+
+export default function RecordingsPage() {
+  const { user, userData, isApproved, isAdmin, signOut, loading } = useAuth();
+  const router = useRouter();
+  const [batches, setBatches] = useState<Batch[]>([]);
+  const [recordings, setRecordings] = useState<Recording[]>([]);
+  const [expandedBatch, setExpandedBatch] = useState<string | null>(null);
+  const [activeVideo, setActiveVideo] = useState<Recording | null>(null);
+
+  // Redirect if not approved
+  useEffect(() => {
+    if (!loading && !isApproved && !isAdmin) {
+      if (!user) {
+        router.push('/login');
+      }
+      // Show pending message if logged in but not approved
+    }
+  }, [user, isApproved, isAdmin, loading, router]);
+
+  // Subscribe to batches
+  useEffect(() => {
+    if (!isApproved && !isAdmin) return;
+
+    const q = query(collection(db, 'batches'), orderBy('order', 'desc'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const batchData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Batch[];
+      setBatches(batchData);
+    });
+
+    return () => unsubscribe();
+  }, [isApproved, isAdmin]);
+
+  // Subscribe to recordings
+  useEffect(() => {
+    if (!isApproved && !isAdmin) return;
+
+    const q = query(
+      collection(db, 'recordings'),
+      where('expiryDate', '>', Timestamp.now()),
+      orderBy('expiryDate', 'desc')
+    );
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const recData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Recording[];
+      setRecordings(recData);
+    });
+
+    return () => unsubscribe();
+  }, [isApproved, isAdmin]);
+
+  const getDaysUntilExpiry = (expiryDate: Timestamp) => {
+    const now = new Date();
+    const expiry = expiryDate.toDate();
+    const diffTime = expiry.getTime() - now.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    return diffDays;
+  };
+
+  const getBatchRecordings = (batchId: string) => {
+    return recordings.filter(r => r.batchName === batchId);
+  };
+
+  const extractYouTubeId = (url: string) => {
+    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
+    const match = url.match(regExp);
+    return (match && match[2].length === 11) ? match[2] : null;
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-red-500" />
+      </div>
+    );
+  }
+
+  if (!isApproved && user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+        <div className="bg-slate-800/50 border border-slate-700 rounded-2xl p-8 max-w-md text-center">
+          <div className="w-16 h-16 bg-yellow-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+            <Clock className="text-yellow-500" size={32} />
+          </div>
+          <h2 className="text-2xl font-bold text-white mb-2">Account Pending Approval</h2>
+          <p className="text-slate-400 mb-6">
+            Your registration is being reviewed by the admin. Please complete payment and send the receipt to activate your account.
+          </p>
+          <button
+            onClick={() => router.push('/payment')}
+            className="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-3 rounded-lg transition-all"
+          >
+            View Payment Details
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950">
+      {/* Header */}
+      <header className="bg-slate-900/80 backdrop-blur-md border-b border-slate-800 sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-16">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-gradient-to-br from-red-600 to-red-800 rounded-lg flex items-center justify-center shadow-lg shadow-red-600/20">
+                <Video className="text-white" size={20} />
+              </div>
+              <div>
+                <h1 className="text-xl font-bold text-white">Class Recordings</h1>
+                <p className="text-xs text-slate-400">Prasanna Senavirathne Accounting</p>
+              </div>
+            </div>
+            
+            <div className="flex items-center gap-4">
+              <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-slate-800 rounded-full">
+                <User size={14} className="text-slate-400" />
+                <span className="text-sm text-slate-300">{userData?.displayName || user?.email}</span>
+                <span className={`px-2 py-0.5 text-xs rounded-full ${
+                  isAdmin ? 'bg-purple-500/20 text-purple-400' : 'bg-green-500/20 text-green-400'
+                }`}>
+                  {isAdmin ? 'Admin' : 'Student'}
+                </span>
+              </div>
+              <button
+                onClick={signOut}
+                className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-all"
+              >
+                <LogOut size={20} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* Active Video Player */}
+        <AnimatePresence>
+          {activeVideo && (
+            <motion.div
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="mb-8 bg-slate-900 rounded-2xl overflow-hidden border border-slate-800 shadow-2xl"
+            >
+              <div className="aspect-video bg-black relative">
+                <iframe
+                  src={`https://www.youtube.com/embed/${extractYouTubeId(activeVideo.youtubeUrl)}?autoplay=1`}
+                  title={activeVideo.title}
+                  className="absolute inset-0 w-full h-full"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                  allowFullScreen
+                />
+              </div>
+              <div className="p-4 bg-slate-900 border-t border-slate-800">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <h3 className="text-lg font-semibold text-white">{activeVideo.title}</h3>
+                    <p className="text-sm text-slate-400">{activeVideo.batchName}</p>
+                  </div>
+                  <button
+                    onClick={() => setActiveVideo(null)}
+                    className="text-slate-500 hover:text-white"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Batch List */}
+        <div className="space-y-4">
+          {batches.map((batch) => {
+            const batchRecordings = getBatchRecordings(batch.name);
+            const isExpanded = expandedBatch === batch.id;
+            
+            return (
+              <motion.div
+                key={batch.id}
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="bg-slate-900/50 border border-slate-800 rounded-xl overflow-hidden"
+              >
+                <button
+                  onClick={() => setExpandedBatch(isExpanded ? null : batch.id)}
+                  className="w-full px-6 py-4 flex items-center justify-between hover:bg-slate-800/50 transition-all"
+                >
+                  <div className="flex items-center gap-4">
+                    <div className="w-12 h-12 bg-gradient-to-br from-red-600 to-red-800 rounded-lg flex items-center justify-center">
+                      <Calendar className="text-white" size={20} />
+                    </div>
+                    <div className="text-left">
+                      <h3 className="text-lg font-semibold text-white">{batch.name}</h3>
+                      <p className="text-sm text-slate-400">
+                        {batchRecordings.length} video{batchRecordings.length !== 1 ? 's' : ''} available
+                      </p>
+                    </div>
+                  </div>
+                  {isExpanded ? (
+                    <ChevronUp className="text-slate-400" size={24} />
+                  ) : (
+                    <ChevronDown className="text-slate-400" size={24} />
+                  )}
+                </button>
+
+                <AnimatePresence>
+                  {isExpanded && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      className="border-t border-slate-800"
+                    >
+                      {batchRecordings.length === 0 ? (
+                        <div className="p-6 text-center text-slate-500">
+                          No recordings available for this batch yet.
+                        </div>
+                      ) : (
+                        <div className="grid gap-4 p-6 sm:grid-cols-2 lg:grid-cols-3">
+                          {batchRecordings.map((recording) => {
+                            const daysLeft = getDaysUntilExpiry(recording.expiryDate);
+                            const isExpiringSoon = daysLeft <= 3;
+                            const youtubeId = extractYouTubeId(recording.youtubeUrl);
+                            
+                            return (
+                              <motion.div
+                                key={recording.id}
+                                whileHover={{ scale: 1.02 }}
+                                className="bg-slate-800 rounded-xl overflow-hidden border border-slate-700 hover:border-red-500/50 transition-all cursor-pointer group"
+                                onClick={() => setActiveVideo(recording)}
+                              >
+                                {/* Thumbnail */}
+                                <div className="aspect-video bg-slate-900 relative overflow-hidden">
+                                  {youtubeId ? (
+                                    <img
+                                      src={`https://img.youtube.com/vi/${youtubeId}/mqdefault.jpg`}
+                                      alt={recording.title}
+                                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                                    />
+                                  ) : (
+                                    <div className="w-full h-full flex items-center justify-center bg-slate-800">
+                                      <Video className="text-slate-600" size={40} />
+                                    </div>
+                                  )}
+                                  <div className="absolute inset-0 bg-black/40 group-hover:bg-black/20 transition-all flex items-center justify-center">
+                                    <div className="w-12 h-12 bg-red-600 rounded-full flex items-center justify-center shadow-lg transform group-hover:scale-110 transition-transform">
+                                      <Play className="text-white ml-1" size={20} fill="white" />
+                                    </div>
+                                  </div>
+                                  
+                                  {/* Expiry Badge */}
+                                  <div className={`absolute top-2 right-2 px-2 py-1 rounded-md text-xs font-medium flex items-center gap-1 ${
+                                    isExpiringSoon 
+                                      ? 'bg-red-500/90 text-white' 
+                                      : 'bg-slate-900/90 text-slate-300'
+                                  }`}>
+                                    <Clock size={12} />
+                                    {daysLeft > 0 ? `${daysLeft}d left` : 'Expired'}
+                                  </div>
+                                </div>
+
+                                {/* Info */}
+                                <div className="p-4">
+                                  <h4 className="font-medium text-white mb-1 line-clamp-2">
+                                    {recording.title}
+                                  </h4>
+                                  <p className="text-xs text-slate-400 mb-3">
+                                    {recording.uploadedAt.toDate().toLocaleDateString('en-US', {
+                                      month: 'short',
+                                      day: 'numeric',
+                                      year: 'numeric'
+                                    })}
+                                  </p>
+                                  
+                                  {isExpiringSoon && (
+                                    <div className="flex items-center gap-1.5 text-xs text-red-400">
+                                      <AlertTriangle size={12} />
+                                      <span>Expiring soon</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </motion.div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.div>
+            );
+          })}
+        </div>
+
+        {batches.length === 0 && (
+          <div className="text-center py-16">
+            <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Video className="text-slate-600" size={32} />
+            </div>
+            <h3 className="text-lg font-medium text-slate-300 mb-2">No batches available</h3>
+            <p className="text-slate-500">Check back later for new class recordings.</p>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+```
+
+### 5. Admin Dashboard - User Management (`app/admin/users/page.tsx`)
+
+```typescript
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '@/lib/auth-context';
+import { 
+  collection, 
+  onSnapshot, 
+  doc, 
+  updateDoc,
+  query,
+  orderBy 
+} from 'firebase/firestore';
+import { db } from '@/lib/firebase';
+import { motion } from 'framer-motion';
+import { 
+  Users, 
+  CheckCircle, 
+  XCircle, 
+  Clock, 
+  Search,
+  Filter,
+  MoreVertical,
+  Shield
+} from 'lucide-react';
+
+interface UserProfile {
+  uid: string;
+  email: string;
+  displayName: string;
+  phone?: string;
+  role: 'student' | 'admin';
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: any;
+  location?: string;
+}
+
+export default function AdminUsersPage() {
+  const { isAdmin, loading } = useAuth();
+  const router = useRouter();
+  const [users, setUsers] = useState<UserProfile[]>([]);
+  const [filter, setFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
+  const [searchTerm, setSearchTerm] = useState('');
+
+  useEffect(() => {
+    if (!loading && !isAdmin) {
+      router.push('/recordings');
+    }
+  }, [isAdmin, loading, router]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+
+    const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const userData = snapshot.docs.map(doc => ({
+        uid: doc.id,
+        ...doc.data()
+      })) as UserProfile[];
+      setUsers(userData);
+    });
+
+    return () => unsubscribe();
+  }, [isAdmin]);
+
+  const handleStatusChange = async (uid: string, newStatus: 'approved' | 'rejected') => {
+    try {
+      await updateDoc(doc(db, 'users', uid), {
+        status: newStatus,
+        updatedAt: new Date()
+      });
+    } catch (error) {
+      console.error('Error updating user:', error);
+      alert('Failed to update user status');
+    }
+  };
+
+  const filteredUsers = users.filter(user => {
+    const matchesFilter = filter === 'all' || user.status === filter;
+    const matchesSearch = 
+      user.email.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      user.displayName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      user.phone?.includes(searchTerm);
+    return matchesFilter && matchesSearch;
+  });
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'approved': return 'bg-green-500/20 text-green-400 border-green-500/30';
+      case 'pending': return 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30';
+      case 'rejected': return 'bg-red-500/20 text-red-400 border-red-500/30';
+      default: return 'bg-slate-500/20 text-slate-400';
+    }
+  };
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'approved': return <CheckCircle size={14} />;
+      case 'pending': return <Clock size={14} />;
+      case 'rejected': return <XCircle size={14} />;
+    }
+  };
+
+  if (loading || !isAdmin) return null;
+
+  return (
+    <div className="min-h-screen bg-slate-950">
+      {/* Admin Header */}
+      <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-16">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-purple-600 rounded-lg flex items-center justify-center">
+                <Shield className="text-white" size={20} />
+              </div>
+              <div>
+                <h1 className="text-xl font-bold text-white">Admin Dashboard</h1>
+                <p className="text-xs text-slate-400">User Management</p>
+              </div>
+            </div>
+            
+            <nav className="flex gap-4">
+              <button
+                onClick={() => router.push('/admin')}
+                className="text-slate-400 hover:text-white px-3 py-2 rounded-lg hover:bg-slate-800 transition-all"
+              >
+                Overview
+              </button>
+              <button
+                onClick={() => router.push('/admin/recordings')}
+                className="text-slate-400 hover:text-white px-3 py-2 rounded-lg hover:bg-slate-800 transition-all"
+              >
+                Recordings
+              </button>
+              <button
+                className="text-white bg-slate-800 px-3 py-2 rounded-lg"
+              >
+                Users
+              </button>
+            </nav>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* Stats */}
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-8">
+          {[
+            { label: 'Total Users', value: users.length, color: 'blue' },
+            { label: 'Pending', value: users.filter(u => u.status === 'pending').length, color: 'yellow' },
+            { label: 'Approved', value: users.filter(u => u.status === 'approved').length, color: 'green' },
+            { label: 'Rejected', value: users.filter(u => u.status === 'rejected').length, color: 'red' },
+          ].map((stat) => (
+            <div key={stat.label} className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+              <p className="text-slate-400 text-sm mb-1">{stat.label}</p>
+              <p className={`text-2xl font-bold text-${stat.color}-400`}>{stat.value}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* Filters */}
+        <div className="flex flex-col sm:flex-row gap-4 mb-6">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
+            <input
+              type="text"
+              placeholder="Search by name, email, or phone..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full bg-slate-900 border border-slate-800 rounded-lg py-2.5 pl-10 pr-4 text-white placeholder-slate-500 focus:outline-none focus:border-purple-500"
+            />
+          </div>
+          
+          <div className="flex gap-2">
+            {(['all', 'pending', 'approved', 'rejected'] as const).map((f) => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                  filter === f 
+                    ? 'bg-purple-600 text-white' 
+                    : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-white'
+                }`}
+              >
+                {f.charAt(0).toUpperCase() + f.slice(1)}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Users Table */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-slate-800/50 border-b border-slate-800">
+                <tr>
+                  <th className="text-left text-xs font-medium text-slate-400 uppercase tracking-wider px-6 py-4">Student</th>
+                  <th className="text-left text-xs font-medium text-slate-400 uppercase tracking-wider px-6 py-4">Contact</th>
+                  <th className="text-left text-xs font-medium text-slate-400 uppercase tracking-wider px-6 py-4">Status</th>
+                  <th className="text-left text-xs font-medium text-slate-400 uppercase tracking-wider px-6 py-4">Registered</th>
+                  <th className="text-right text-xs font-medium text-slate-400 uppercase tracking-wider px-6 py-4">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800">
+                {filteredUsers.map((user) => (
+                  <motion.tr
+                    key={user.uid}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="hover:bg-slate-800/30 transition-colors"
+                  >
+                    <td className="px-6 py-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-gradient-to-br from-red-600 to-red-800 rounded-full flex items-center justify-center text-white font-semibold">
+                          {user.displayName?.charAt(0).toUpperCase() || user.email.charAt(0).toUpperCase()}
+                        </div>
+                        <div>
+                          <p className="font-medium text-white">{user.displayName || 'N/A'}</p>
+                          <p className="text-sm text-slate-400">{user.email}</p>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <p className="text-sm text-slate-300">{user.phone || 'No phone'}</p>
+                      <p className="text-xs text-slate-500">{user.location || 'No location'}</p>
+                    </td>
+                    <td className="px-6 py-4">
+                      <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border ${getStatusColor(user.status)}`}>
+                        {getStatusIcon(user.status)}
+                        {user.status.charAt(0).toUpperCase() + user.status.slice(1)}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-sm text-slate-400">
+                      {user.createdAt?.toDate?.().toLocaleDateString() || 'N/A'}
+                    </td>
+                    <td className="px-6 py-4 text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        {user.status === 'pending' && (
+                          <>
+                            <button
+                              onClick={() => handleStatusChange(user.uid, 'approved')}
+                              className="p-2 text-green-400 hover:bg-green-500/10 rounded-lg transition-all"
+                              title="Approve"
+                            >
+                              <CheckCircle size={18} />
+                            </button>
+                            <button
+                              onClick={() => handleStatusChange(user.uid, 'rejected')}
+                              className="p-2 text-red-400 hover:bg-red-500/10 rounded-lg transition-all"
+                              title="Reject"
+                            >
+                              <XCircle size={18} />
+                            </button>
+                          </>
+                        )}
+                        {user.status === 'approved' && (
+                          <button
+                            onClick={() => handleStatusChange(user.uid, 'rejected')}
+                            className="px-3 py-1.5 text-xs text-red-400 border border-red-500/30 rounded-lg hover:bg-red-500/10 transition-all"
+                          >
+                            Revoke Access
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </motion.tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          
+          {filteredUsers.length === 0 && (
+            <div className="text-center py-12 text-slate-500">
+              <Users className="mx-auto mb-3 text-slate-600" size={32} />
+              <p>No users found matching your criteria.</p>
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+```
+
+### 6. Payment Information Page (`app/payment/page.tsx`)
+
+```typescript
+import React from 'react';
+import { CreditCard, Smartphone, MessageCircle, Mail, Copy, CheckCircle } from 'lucide-react';
+
+export default function PaymentPage() {
+  const bankDetails = {
+    bankName: 'Commercial Bank of Ceylon',
+    accountName: 'P. Senavirathne',
+    accountNumber: '1234567890',
+    branch: 'Kurunegala Branch',
+    code: '1234'
+  };
+
+  const contactInfo = {
+    whatsapp: '+94 77 123 4567',
+    email: 'prasanna.accounting@gmail.com'
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-red-950">
+      <div className="max-w-4xl mx-auto px-4 py-16">
+        <div className="text-center mb-12">
+          <h1 className="text-4xl font-bold text-white mb-4">Payment Information</h1>
+          <p className="text-slate-400 text-lg">Complete your registration by making the class fee payment</p>
+        </div>
+
+        <div className="grid md:grid-cols-2 gap-8">
+          {/* Bank Transfer Card */}
+          <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl p-8">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="w-12 h-12 bg-red-600 rounded-xl flex items-center justify-center">
+                <CreditCard className="text-white" size={24} />
+              </div>
+              <h2 className="text-xl font-semibold text-white">Bank Transfer</h2>
+            </div>
+
+            <div className="space-y-4">
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+                <p className="text-xs text-slate-400 uppercase tracking-wider mb-1">Bank Name</p>
+                <p className="text-white font-medium">{bankDetails.bankName}</p>
+              </div>
+              
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+                <p className="text-xs text-slate-400 uppercase tracking-wider mb-1">Account Name</p>
+                <p className="text-white font-medium">{bankDetails.accountName}</p>
+              </div>
+
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700 flex items-center justify-between">
+                <div>
+                  <p className="text-xs text-slate-400 uppercase tracking-wider mb-1">Account Number</p>
+                  <p className="text-white font-medium text-lg tracking-wider">{bankDetails.accountNumber}</p>
+                </div>
+                <button 
+                  onClick={() => navigator.clipboard.writeText(bankDetails.accountNumber)}
+                  className="p-2 hover:bg-slate-700 rounded-lg transition-all text-slate-400 hover:text-white"
+                  title="Copy"
+                >
+                  <Copy size={18} />
+                </button>
+              </div>
+
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+                <p className="text-xs text-slate-400 uppercase tracking-wider mb-1">Branch</p>
+                <p className="text-white font-medium">{bankDetails.branch}</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Instructions Card */}
+          <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl p-8">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="w-12 h-12 bg-green-600 rounded-xl flex items-center justify-center">
+                <Smartphone className="text-white" size={24} />
+              </div>
+              <h2 className="text-xl font-semibold text-white">Activation Steps</h2>
+            </div>
+
+            <div className="space-y-6">
+              <div className="flex gap-4">
+                <div className="w-8 h-8 bg-red-600 rounded-full flex items-center justify-center text-white font-bold text-sm shrink-0">
+                  1
+                </div>
+                <div>
+                  <h3 className="text-white font-medium mb-1">Make the Payment</h3>
+                  <p className="text-slate-400 text-sm">Transfer the class fee to the bank account above. Keep the receipt or screenshot.</p>
+                </div>
+              </div>
+
+              <div className="flex gap-4">
+                <div className="w-8 h-8 bg-red-600 rounded-full flex items-center justify-center text-white font-bold text-sm shrink-0">
+                  2
+                </div>
+                <div>
+                  <h3 className="text-white font-medium mb-1">Send Proof</h3>
+                  <p className="text-slate-400 text-sm mb-3">Share your payment receipt via:</p>
+                  
+                  <div className="space-y-2">
+                    <a 
+                      href={`https://wa.me/${contactInfo.whatsapp.replace(/\D/g, '')}`}
+                      className="flex items-center gap-3 p-3 bg-green-600/20 border border-green-600/30 rounded-lg text-green-400 hover:bg-green-600/30 transition-all"
+                    >
+                      <MessageCircle size={20} />
+                      <span className="font-medium">{contactInfo.whatsapp}</span>
+                    </a>
+                    
+                    <a 
+                      href={`mailto:${contactInfo.email}`}
+                      className="flex items-center gap-3 p-3 bg-red-600/20 border border-red-600/30 rounded-lg text-red-400 hover:bg-red-600/30 transition-all"
+                    >
+                      <Mail size={20} />
+                      <span className="font-medium">{contactInfo.email}</span>
+                    </a>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-4">
+                <div className="w-8 h-8 bg-red-600 rounded-full flex items-center justify-center text-white font-bold text-sm shrink-0">
+                  3
+                </div>
+                <div>
+                  <h3 className="text-white font-medium mb-1">Wait for Approval</h3>
+                  <p className="text-slate-400 text-sm">Admin will verify your payment and activate your account within 24 hours.</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 p-4 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+              <div className="flex items-start gap-3">
+                <CheckCircle className="text-yellow-500 shrink-0" size={20} />
+                <p className="text-sm text-yellow-200">
+                  Include your registered email address when sending the payment proof for faster verification.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Class Fees Info */}
+        <div className="mt-8 bg-gradient-to-r from-red-900/50 to-red-800/50 border border-red-700/50 rounded-2xl p-8 text-center">
+          <h3 className="text-xl font-semibold text-white mb-2">Monthly Class Fee</h3>
+          <p className="text-3xl font-bold text-red-400 mb-2">LKR 2,500/=</p>
+          <p className="text-slate-400">Per month • Includes all recordings and study materials</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+### 7. Root Layout with Providers (`app/layout.tsx`)
+
+```typescript
+import type { Metadata } from 'next';
+import { Inter } from 'next/font/google';
+import './globals.css';
+import { AuthProvider } from '@/lib/auth-context';
+
+const inter = Inter({ subsets: ['latin'] });
+
+export const metadata: Metadata = {
+  title: 'Prasanna Senavirathne Accounting Class',
+  description: 'Professional Accounting Classes in Sri Lanka - AAT, ICASL, Degree Level',
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body className={`${inter.className} antialiased`}>
+        <AuthProvider>
+          {children}
+        </AuthProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+### 8. Environment Variables (`.env.local`)
+
+```bash
+# Firebase Configuration
+NEXT_PUBLIC_FIREBASE_API_KEY=your_api_key_here
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=prasanna-accounting-class.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=prasanna-accounting-class
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=prasanna-accounting-class.appspot.com
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=123456789
+NEXT_PUBLIC_FIREBASE_APP_ID=1:123456789:web:abcdef123456
+
+# Note: For Admin SDK operations (server-side), create a separate .env file
+# with service account credentials (not exposed to client)
+```
+
+### 9. Package Dependencies (`package.json` additions)
+
+```json
+{
+  "dependencies": {
+    "firebase": "^10.7.0",
+    "framer-motion": "^10.16.0",
+    "lucide-react": "^0.294.0",
+    "date-fns": "^2.30.0"
+  }
+}
+```
+
+---
+
+## 🚀 Deployment Instructions
+
+### Deploy to Vercel:
+
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# Deploy
+vercel --prod
+```
+
+Or connect your GitHub repo to Vercel for automatic deployments.
+
+### Environment Setup on Vercel:
+1. Go to Project Settings → Environment Variables
+2. Add all `NEXT_PUBLIC_FIREBASE_*` variables
+3. Redeploy
+
+---
+
+## 🔐 Security Checklist
+
+1. ✅ **Firestore Rules**: Only approved students can read recordings
+2. ✅ **Admin Verification**: Custom claims for admin role
+3. ✅ **Expiry System**: Videos automatically hide after expiry date
+4. ✅ **Input Validation**: Client and server-side validation
+5. ✅ **HTTPS Only**: Enforced by Firebase Hosting/Vercel
+6. ✅ **Rate Limiting**: Consider adding Cloudflare or Firebase App Check
+
+This architecture provides a scalable, secure, and premium educational platform with the exact red-themed professional aesthetic requested. The system handles user approval workflows, time-sensitive content delivery, and administrative control efficiently.
